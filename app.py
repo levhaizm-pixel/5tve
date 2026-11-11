@@ -2,79 +2,95 @@
 import os
 import sqlite3
 import secrets
+from datetime import datetime
 from functools import wraps
 
 from flask import (
-    Flask, request, redirect, url_for,
-    session, flash, send_from_directory,
-    render_template_string, abort
+    Flask, request, redirect, url_for, session,
+    flash, send_from_directory, render_template_string,
+    abort
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+
+
+# =========================================================
+# AYARLAR
+# =========================================================
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-DB_PATH = os.path.join(BASE_DIR, "5tve.db")
+PROFILE_FOLDER = os.path.join(UPLOAD_FOLDER, "profiles")
+DATABASE = os.path.join(BASE_DIR, "5tve.db")
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(PROFILE_FOLDER, exist_ok=True)
 
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
-ALLOWED_EXTENSIONS = {"mp4", "webm", "mov", "m4v"}
-
-CATEGORIES = [
-    "Eğlence", "Oyun", "Müzik", "Spor",
-    "Teknoloji", "Eğitim", "Diğer"
-]
+VIDEO_EXTENSIONS = {"mp4", "webm", "mov", "m4v"}
+IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 
 
-# =========================
+# =========================================================
 # VERİTABANI
-# =========================
+# =========================================================
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
+def get_db():
+    conn = sqlite3.connect(DATABASE)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def init_db():
-    conn = db()
+    conn = get_db()
 
-    conn.executescript("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL
-        );
+            password TEXT NOT NULL,
+            profile_image TEXT
+        )
+    """)
 
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS videos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             description TEXT,
             filename TEXT NOT NULL,
             user_id INTEGER NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
+            category TEXT DEFAULT 'Genel',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+    """)
 
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS likes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             video_id INTEGER NOT NULL,
             UNIQUE(user_id, video_id)
-        );
+        )
+    """)
 
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS comments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            video_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
+            video_id INTEGER NOT NULL,
             content TEXT NOT NULL,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
+        )
+    """)
 
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             subscriber_id INTEGER NOT NULL,
@@ -82,8 +98,10 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(subscriber_id, channel_id),
             CHECK(subscriber_id != channel_id)
-        );
+        )
+    """)
 
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -92,17 +110,26 @@ def init_db():
             message TEXT NOT NULL,
             is_read INTEGER DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
+        )
     """)
 
-    columns = [
-        row["name"] for row in
-        conn.execute("PRAGMA table_info(videos)").fetchall()
+    # Eski veritabanlarına eksik sütunları ekle.
+    user_columns = [
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(users)").fetchall()
     ]
 
-    if "category" not in columns:
+    if "profile_image" not in user_columns:
+        conn.execute("ALTER TABLE users ADD COLUMN profile_image TEXT")
+
+    video_columns = [
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(videos)").fetchall()
+    ]
+
+    if "category" not in video_columns:
         conn.execute(
-            "ALTER TABLE videos ADD COLUMN category TEXT DEFAULT 'Diğer'"
+            "ALTER TABLE videos ADD COLUMN category TEXT DEFAULT 'Genel'"
         )
 
     conn.commit()
@@ -112,9 +139,9 @@ def init_db():
 init_db()
 
 
-# =========================
+# =========================================================
 # YARDIMCI FONKSİYONLAR
-# =========================
+# =========================================================
 
 def login_required(func):
     @wraps(func)
@@ -126,50 +153,59 @@ def login_required(func):
     return wrapper
 
 
-def allowed_file(filename):
+def current_user():
+    if "user_id" not in session:
+        return None
+
+    conn = get_db()
+    user = conn.execute(
+        "SELECT * FROM users WHERE id = ?",
+        (session["user_id"],)
+    ).fetchone()
+    conn.close()
+    return user
+
+
+def allowed_file(filename, extensions):
     return (
-        "." in filename and
-        filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+        "." in filename
+        and filename.rsplit(".", 1)[1].lower() in extensions
     )
 
 
-def get_video(video_id):
-    conn = db()
-
-    video = conn.execute("""
-        SELECT videos.*, users.username,
-        (SELECT COUNT(*) FROM likes
-         WHERE likes.video_id = videos.id) AS like_count,
-        (SELECT COUNT(*) FROM comments
-         WHERE comments.video_id = videos.id) AS comment_count
-        FROM videos
-        JOIN users ON users.id = videos.user_id
-        WHERE videos.id = ?
-    """, (video_id,)).fetchone()
-
+def subscriber_count(user_id):
+    conn = get_db()
+    count = conn.execute(
+        "SELECT COUNT(*) FROM subscriptions WHERE channel_id = ?",
+        (user_id,)
+    ).fetchone()[0]
     conn.close()
-    return video
+    return count
 
 
-@app.context_processor
-def global_template_data():
-    unread_count = 0
-
-    if session.get("user_id"):
-        conn = db()
-        unread_count = conn.execute("""
-            SELECT COUNT(*) AS total
-            FROM notifications
-            WHERE user_id = ? AND is_read = 0
-        """, (session["user_id"],)).fetchone()["total"]
-        conn.close()
-
-    return {"unread_count": unread_count}
+def is_subscribed(subscriber_id, channel_id):
+    conn = get_db()
+    result = conn.execute("""
+        SELECT id FROM subscriptions
+        WHERE subscriber_id = ? AND channel_id = ?
+    """, (subscriber_id, channel_id)).fetchone()
+    conn.close()
+    return result is not None
 
 
-# =========================
+def unread_count(user_id):
+    conn = get_db()
+    count = conn.execute("""
+        SELECT COUNT(*) FROM notifications
+        WHERE user_id = ? AND is_read = 0
+    """, (user_id,)).fetchone()[0]
+    conn.close()
+    return count
+
+
+# =========================================================
 # TASARIM
-# =========================
+# =========================================================
 
 BASE = """
 <!DOCTYPE html>
@@ -177,592 +213,730 @@ BASE = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>5TVE - Video Platformu</title>
-
+<title>{{ title }} - 5TVE</title>
 <style>
 *{box-sizing:border-box}
-
 body{
     margin:0;
+    background:#080b16;
+    color:#f5f5ff;
     font-family:Arial,sans-serif;
-    color:#fff;
-    background:
-      radial-gradient(ellipse at 15% 15%,#32216c 0%,transparent 35%),
-      radial-gradient(ellipse at 85% 75%,#123d75 0%,transparent 35%),
-      linear-gradient(135deg,#080b18,#10152b 55%,#090d1c);
-    min-height:100vh;
 }
-
-body:before{
-    content:"";
-    position:fixed;
-    inset:0;
-    pointer-events:none;
-    opacity:.12;
-    background-image:
-      linear-gradient(45deg,transparent 48%,#8794ff 49%,transparent 50%),
-      linear-gradient(-45deg,transparent 48%,#8794ff 49%,transparent 50%);
-    background-size:65px 65px;
-}
-
 nav{
-    position:sticky;
-    top:0;
-    z-index:10;
+    background:#10152a;
+    border-bottom:1px solid #252b49;
+    padding:16px 5%;
     display:flex;
     align-items:center;
     justify-content:space-between;
     gap:15px;
     flex-wrap:wrap;
-    padding:16px 5%;
-    background:rgba(8,11,25,.88);
-    backdrop-filter:blur(15px);
-    border-bottom:1px solid #30365b;
 }
-
 .logo{
-    font-size:27px;
+    font-size:28px;
     font-weight:900;
-    letter-spacing:2px;
-    background:linear-gradient(90deg,#44c8ff,#a66cff);
-    -webkit-background-clip:text;
-    color:transparent;
+    color:#a78bfa;
     text-decoration:none;
 }
-
 .navlinks{
     display:flex;
-    gap:9px;
+    gap:16px;
     flex-wrap:wrap;
+    align-items:center;
 }
-
-.navlinks a{
-    color:#dce2ff;
-    text-decoration:none;
-    padding:11px 14px;
-    border-radius:12px;
-    background:#171d37;
-    border:1px solid #30385f;
-    transition:.2s;
-}
-
-.navlinks a:hover{
-    background:#34316c;
-    border-color:#8b75ff;
-    transform:translateY(-2px);
-}
-
-.container{
-    width:90%;
-    max-width:1250px;
-    margin:35px auto;
-    position:relative;
-}
-
-.hero{
-    padding:55px 35px;
-    border:1px solid #45457e;
-    border-radius:25px;
-    background:linear-gradient(
-        120deg,
-        rgba(43,48,104,.9),
-        rgba(18,48,87,.75)
-    );
-    box-shadow:0 15px 50px #0005;
-    margin-bottom:35px;
-}
-
-.hero h1{
-    font-size:42px;
-    margin:0 0 12px;
-}
-
-.hero p{
-    color:#c5cbea;
-    font-size:16px;
-}
-
-.btn{
-    display:inline-block;
-    background:linear-gradient(90deg,#6655ff,#249bff);
+a{color:#c4b5fd;text-decoration:none}
+a:hover{color:white}
+.navlinks a{font-size:14px}
+.container{max-width:1150px;margin:30px auto;padding:0 18px}
+h1,h2,h3{color:white}
+input,textarea,select{
+    width:100%;
+    padding:12px;
+    margin:8px 0;
+    border:1px solid #343b61;
+    border-radius:9px;
+    background:#11172d;
     color:white;
-    padding:12px 20px;
+}
+button,.btn{
+    display:inline-block;
+    padding:11px 17px;
+    background:linear-gradient(100deg,#6d5dfc,#a855f7);
+    color:white;
     border:0;
-    border-radius:12px;
-    text-decoration:none;
+    border-radius:9px;
     cursor:pointer;
     font-weight:bold;
 }
-
-.btn:hover{filter:brightness(1.15)}
-
-.section-title{
-    font-size:24px;
-    margin:25px 0;
-}
-
+button:hover,.btn:hover{opacity:.85;color:white}
 .grid{
     display:grid;
-    grid-template-columns:repeat(
-        auto-fill,
-        minmax(245px,1fr)
-    );
-    gap:22px;
+    grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
+    gap:20px;
 }
-
-.video-card{
-    overflow:hidden;
-    background:#151b32;
-    border:1px solid #30385b;
-    border-radius:18px;
-    transition:.25s;
-}
-
-.video-card:hover{
-    transform:translateY(-5px);
-    border-color:#8174ff;
-    box-shadow:0 12px 35px #0006;
-}
-
-.thumbnail{
-    height:155px;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    font-size:48px;
-    background:linear-gradient(135deg,#342b75,#146a9c);
-}
-
-.video-info{padding:16px}
-
-.video-info h3{
-    margin:0 0 10px;
-    font-size:17px;
-}
-
-.video-info p{
-    color:#aab4d5;
-    font-size:13px;
-}
-
-.video-info a{
-    color:white;
-    text-decoration:none;
-}
-
-.form-box{
-    max-width:600px;
-    margin:35px auto;
-    padding:30px;
-    border-radius:22px;
-    border:1px solid #414778;
-    background:rgba(20,26,51,.94);
-    box-shadow:0 15px 45px #0005;
-}
-
-input,textarea,select{
-    width:100%;
-    padding:14px;
-    margin:9px 0 17px;
-    background:#0c1227;
-    color:white;
-    border:1px solid #414b78;
-    border-radius:10px;
-    outline:none;
-}
-
-input:focus,textarea:focus,select:focus{
-    border-color:#8174ff;
-}
-
-label{
-    color:#d5dcff;
-    font-weight:bold;
-}
-
-video{
-    width:100%;
-    max-height:600px;
-    background:#000;
-    border-radius:15px;
-}
-
-.profile-header{
-    padding:35px;
-    border-radius:20px;
-    background:linear-gradient(120deg,#28245c,#143b65);
-    margin-bottom:30px;
-}
-
-.avatar{
-    width:75px;
-    height:75px;
-    border-radius:50%;
-    display:flex;
-    align-items:center;
-    justify-content:center;
-    font-size:28px;
-    font-weight:bold;
-    background:linear-gradient(135deg,#8b5cff,#27b7ff);
-    margin-bottom:15px;
-}
-
-.comment{
-    padding:15px;
-    background:#171e38;
-    border-radius:12px;
-    margin:12px 0;
-}
-
-.flash{
-    padding:13px;
-    border-radius:10px;
-    background:#34315f;
-    margin-bottom:15px;
-}
-
-.notification{
-    padding:18px;
-    background:#171e38;
-    border:1px solid #30385b;
+.card{
+    background:#11172a;
+    border:1px solid #252d4b;
     border-radius:14px;
-    margin-bottom:13px;
+    overflow:hidden;
+    padding:14px;
 }
-
-.notification.unread{
-    border-color:#8174ff;
-    background:#202447;
+.card video,.thumb{
+    width:100%;
+    border-radius:10px;
 }
-
+.card h3{margin-bottom:7px}
+.muted{color:#9ca3bd;font-size:13px}
+.panel{
+    background:#11172a;
+    border:1px solid #293052;
+    border-radius:15px;
+    padding:22px;
+    margin-bottom:20px;
+}
+.profile{
+    width:95px;height:95px;
+    border-radius:50%;
+    object-fit:cover;
+    background:#6555d9;
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    font-size:38px;
+    font-weight:bold;
+}
+.avatar-small{
+    width:38px;height:38px;
+    border-radius:50%;
+    object-fit:cover;
+    vertical-align:middle;
+}
+.flash{
+    background:#28234c;
+    border:1px solid #6854ce;
+    padding:12px;
+    border-radius:9px;
+    margin-bottom:12px;
+}
+form{margin:0}
+.inline{display:inline-block}
 footer{
     text-align:center;
-    color:#8995bb;
+    color:#777f9f;
     padding:35px;
 }
-
 @media(max-width:600px){
-    .hero h1{font-size:30px}
-    nav{justify-content:center}
-    .navlinks{justify-content:center}
+    nav{align-items:flex-start}
+    .navlinks{gap:11px}
 }
 </style>
 </head>
-
 <body>
 
 <nav>
-    <a class="logo" href="/">5TVE</a>
-
+    <a class="logo" href="{{ url_for('home') }}">5TVE</a>
     <div class="navlinks">
-        <a href="/">🏠 Ana Sayfa</a>
-        <a href="/kesfet">🔥 Keşfet</a>
-        <a href="/kategoriler">🗂️ Kategoriler</a>
-        <a href="/yukle">⬆️ Yükle</a>
-
-        {% if session.get('user_id') %}
-            <a href="/profil">👤 Profil</a>
-            <a href="/abonelikler">⭐ Aboneliklerim</a>
-            <a href="/bildirimler">
-                🔔 Bildirimler
-                {% if unread_count > 0 %}
-                    ({{ unread_count }})
-                {% endif %}
+        <a href="{{ url_for('home') }}">Ana Sayfa</a>
+        <a href="{{ url_for('kesfet') }}">Keşfet</a>
+        <a href="{{ url_for('kategoriler') }}">Kategoriler</a>
+        {% if user %}
+            <a href="{{ url_for('yukle') }}">＋ Yükle</a>
+            <a href="{{ url_for('abonelikler') }}">⭐ Aboneliklerim</a>
+            <a href="{{ url_for('bildirimler') }}">
+                🔔 Bildirimler{% if unread %} ({{ unread }}){% endif %}
             </a>
-            <a href="/cikis">🚪 Çıkış</a>
+            <a href="{{ url_for('profil') }}">Profil</a>
+            <a href="{{ url_for('cikis') }}">Çıkış</a>
         {% else %}
-            <a href="/giris">🔑 Giriş</a>
-            <a href="/kayit">✨ Kayıt Ol</a>
+            <a href="{{ url_for('giris') }}">Giriş</a>
+            <a href="{{ url_for('kayit') }}">Kayıt Ol</a>
         {% endif %}
     </div>
 </nav>
 
 <div class="container">
-
     {% with messages = get_flashed_messages() %}
-      {% for message in messages %}
-        <div class="flash">{{ message }}</div>
-      {% endfor %}
+        {% for message in messages %}
+            <div class="flash">{{ message }}</div>
+        {% endfor %}
     {% endwith %}
 
     {{ content|safe }}
-
 </div>
 
-<footer>© 2026 5TVE · Herkes için video platformu</footer>
-
+<footer>5TVE © 2026 - Video paylaşım platformu</footer>
 </body>
 </html>
 """
 
 
-def page(content, **kwargs):
+def page(title, template, **kwargs):
+    user = current_user()
+    unread = unread_count(user["id"]) if user else 0
+    content = render_template_string(
+        template,
+        user=user,
+        unread=unread,
+        **kwargs
+    )
     return render_template_string(
         BASE,
-        content=render_template_string(content, **kwargs)
+        title=title,
+        content=content,
+        user=user,
+        unread=unread
     )
 
 
 VIDEO_CARD = """
-<div class="video-card">
-
-    <a href="{{ url_for('izle', video_id=v['id']) }}">
-        <div class="thumbnail">▶</div>
+<div class="card">
+    <a href="{{ url_for('izle', video_id=v.id) }}">
+        <video class="thumb" preload="metadata">
+            <source src="{{ url_for('video_file', filename=v.filename) }}">
+        </video>
+        <h3>{{ v.title }}</h3>
     </a>
-
-    <div class="video-info">
-
-        <h3>
-            <a href="{{ url_for('izle', video_id=v['id']) }}">
-                {{ v['title'] }}
-            </a>
-        </h3>
-
-        <p>
-            👤
-            <a href="{{ url_for('kanal', username=v['username']) }}">
-                {{ v['username'] }}
-            </a>
-        </p>
-
-        <p>
-            ❤️ {{ v['like_count'] }} beğeni
-            · 💬 {{ v['comment_count'] }} yorum
-        </p>
-
-        <p>🗂️ {{ v['category'] or 'Diğer' }}</p>
-
-    </div>
+    <p class="muted">
+        <a href="{{ url_for('kanal', username=v.username) }}">
+            {% if v.profile_image %}
+                <img class="avatar-small"
+                src="{{ url_for('profile_file', filename=v.profile_image) }}">
+            {% endif %}
+            {{ v.username }}
+        </a>
+        · {{ v.category or 'Genel' }}
+    </p>
+    <p class="muted">{{ v.created_at }}</p>
 </div>
 """
 
 
-# =========================
-# ANA SAYFA
-# =========================
+# =========================================================
+# ANA SAYFA VE KEŞFET
+# =========================================================
+
+def get_videos(search=None, category=None):
+    conn = get_db()
+
+    sql = """
+        SELECT videos.*, users.username, users.profile_image
+        FROM videos
+        JOIN users ON users.id = videos.user_id
+        WHERE 1=1
+    """
+    params = []
+
+    if search:
+        sql += " AND (videos.title LIKE ? OR videos.description LIKE ?)"
+        params.extend([f"%{search}%", f"%{search}%"])
+
+    if category:
+        sql += " AND videos.category = ?"
+        params.append(category)
+
+    sql += " ORDER BY videos.id DESC"
+
+    videos = conn.execute(sql, params).fetchall()
+    conn.close()
+    return videos
+
 
 @app.route("/")
-def index():
-    q = request.args.get("q", "").strip()
-    conn = db()
+def home():
+    videos = get_videos(request.args.get("q"))
+    return page("Ana Sayfa", """
+    <h1>5TVE'ye Hoş Geldin!</h1>
+    <p class="muted">Videoları keşfet, paylaş ve kanallara abone ol.</p>
 
-    if q:
-        videos = conn.execute("""
-            SELECT videos.*, users.username,
-            (SELECT COUNT(*) FROM likes
-             WHERE video_id=videos.id) AS like_count,
-            (SELECT COUNT(*) FROM comments
-             WHERE video_id=videos.id) AS comment_count
-            FROM videos
-            JOIN users ON users.id=videos.user_id
-            WHERE videos.title LIKE ?
-               OR videos.description LIKE ?
-            ORDER BY videos.id DESC
-        """, (f"%{q}%", f"%{q}%")).fetchall()
-
-    else:
-        videos = conn.execute("""
-            SELECT videos.*, users.username,
-            (SELECT COUNT(*) FROM likes
-             WHERE video_id=videos.id) AS like_count,
-            (SELECT COUNT(*) FROM comments
-             WHERE video_id=videos.id) AS comment_count
-            FROM videos
-            JOIN users ON users.id=videos.user_id
-            ORDER BY videos.id DESC
-        """).fetchall()
-
-    conn.close()
-
-    cards = "".join(
-        render_template_string(VIDEO_CARD, v=v)
-        for v in videos
-    )
-
-    content = """
-    <div class="hero">
-        <h1>5TVE'ye Hoş Geldin! 🚀</h1>
-        <p>
-            En sevdiğin videoları keşfet,
-            paylaş ve kendi kanalını oluştur.
-        </p>
-        <a class="btn" href="/kesfet">
-            Videoları Keşfet →
-        </a>
-    </div>
-
-    <form method="GET" action="/"
-          style="display:flex;gap:10px">
-        <input name="q"
-               placeholder="Video ara..."
-               value="{{ q }}">
-        <button class="btn"
-                style="margin:9px 0 17px">
-            🔍 Ara
-        </button>
+    <form method="GET">
+        <input name="q" placeholder="Video ara..."
+        value="{{ request.args.get('q','') }}">
+        <button>Ara</button>
     </form>
 
-    <h2 class="section-title">🎬 Son Videolar</h2>
+    <h2>Son Videolar</h2>
+    <div class="grid">
+        {% for v in videos %}
+            """ + VIDEO_CARD + """
+        {% else %}
+            <p>Henüz video yüklenmemiş.</p>
+        {% endfor %}
+    </div>
+    """, videos=videos)
 
-    {% if cards %}
-        <div class="grid">{{ cards|safe }}</div>
-    {% else %}
-        <p>Henüz video yüklenmemiş. İlk videoyu sen yükle!</p>
-    {% endif %}
-    """
-
-    return page(content, cards=cards, q=q)
-
-
-# =========================
-# KEŞFET
-# =========================
 
 @app.route("/kesfet")
 def kesfet():
-    conn = db()
-
-    videos = conn.execute("""
-        SELECT videos.*, users.username,
-        (SELECT COUNT(*) FROM likes
-         WHERE video_id=videos.id) AS like_count,
-        (SELECT COUNT(*) FROM comments
-         WHERE video_id=videos.id) AS comment_count
-        FROM videos
-        JOIN users ON users.id=videos.user_id
-        ORDER BY videos.id DESC
-    """).fetchall()
-
-    conn.close()
-
-    cards = "".join(
-        render_template_string(VIDEO_CARD, v=v)
-        for v in videos
-    )
-
-    return page("""
-        <h1 class="section-title">🔥 Videoları Keşfet</h1>
-
-        {% if cards %}
-            <div class="grid">{{ cards|safe }}</div>
+    videos = get_videos()
+    return page("Keşfet", """
+    <h1>Keşfet</h1>
+    <div class="grid">
+        {% for v in videos %}
+            """ + VIDEO_CARD + """
         {% else %}
-            <p>Henüz keşfedilecek video yok.</p>
-        {% endif %}
-    """, cards=cards)
+            <p>Henüz video yok.</p>
+        {% endfor %}
+    </div>
+    """, videos=videos)
 
-
-# =========================
-# KATEGORİLER
-# =========================
 
 @app.route("/kategoriler")
 def kategoriler():
-    return page("""
-        <h1 class="section-title">🗂️ Kategoriler</h1>
+    conn = get_db()
+    categories = conn.execute("""
+        SELECT DISTINCT category FROM videos
+        WHERE category IS NOT NULL AND category != ''
+        ORDER BY category
+    """).fetchall()
+    conn.close()
 
-        <div class="grid">
+    return page("Kategoriler", """
+    <h1>Kategoriler</h1>
+    <div class="grid">
         {% for c in categories %}
-            <a class="video-card"
-               style="padding:35px;text-align:center;
-                      color:white;text-decoration:none"
-               href="{{ url_for('kategori', category=c) }}">
-
-                <div style="font-size:35px">🎥</div>
-                <h2>{{ c }}</h2>
-                <p>Videoları görüntüle →</p>
-
+            <a class="card"
+            href="{{ url_for('kategori', category=c.category) }}">
+                <h3>{{ c.category }}</h3>
+                <p class="muted">Videoları görüntüle</p>
             </a>
+        {% else %}
+            <p>Henüz kategori bulunmuyor.</p>
         {% endfor %}
-        </div>
-    """, categories=CATEGORIES)
+    </div>
+    """, categories=categories)
 
 
 @app.route("/kategori/<category>")
 def kategori(category):
-    conn = db()
+    videos = get_videos(category=category)
+    return page(category, """
+    <h1>{{ category }}</h1>
+    <div class="grid">
+        {% for v in videos %}
+            """ + VIDEO_CARD + """
+        {% else %}
+            <p>Bu kategoride video yok.</p>
+        {% endfor %}
+    </div>
+    """, videos=videos, category=category)
+
+
+# =========================================================
+# KAYIT / GİRİŞ / ÇIKIŞ
+# =========================================================
+
+@app.route("/kayit", methods=["GET", "POST"])
+def kayit():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        if len(username) < 3 or len(password) < 6:
+            flash("Kullanıcı adı en az 3, şifre en az 6 karakter olmalı.")
+            return redirect(url_for("kayit"))
+
+        conn = get_db()
+        try:
+            conn.execute("""
+                INSERT INTO users (username, password)
+                VALUES (?, ?)
+            """, (username, generate_password_hash(password)))
+            conn.commit()
+            flash("Hesabın oluşturuldu. Giriş yapabilirsin.")
+            return redirect(url_for("giris"))
+        except sqlite3.IntegrityError:
+            flash("Bu kullanıcı adı zaten alınmış.")
+        finally:
+            conn.close()
+
+    return page("Kayıt Ol", """
+    <div class="panel">
+        <h1>Hesap Oluştur</h1>
+        <form method="POST">
+            <input name="username" placeholder="Kullanıcı adı" required>
+            <input type="password" name="password"
+            placeholder="Şifre" required>
+            <button type="submit">Kayıt Ol</button>
+        </form>
+    </div>
+    """)
+
+
+@app.route("/giris", methods=["GET", "POST"])
+def giris():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        conn = get_db()
+        account = conn.execute(
+            "SELECT * FROM users WHERE username = ?",
+            (username,)
+        ).fetchone()
+        conn.close()
+
+        if account and check_password_hash(account["password"], password):
+            session.clear()
+            session["user_id"] = account["id"]
+            flash("Giriş başarılı!")
+            return redirect(url_for("home"))
+
+        flash("Kullanıcı adı veya şifre yanlış.")
+
+    return page("Giriş", """
+    <div class="panel">
+        <h1>Giriş Yap</h1>
+        <form method="POST">
+            <input name="username" placeholder="Kullanıcı adı" required>
+            <input type="password" name="password"
+            placeholder="Şifre" required>
+            <button type="submit">Giriş Yap</button>
+        </form>
+    </div>
+    """)
+
+
+@app.route("/cikis")
+def cikis():
+    session.clear()
+    flash("Çıkış yapıldı.")
+    return redirect(url_for("home"))
+
+
+# =========================================================
+# PROFİL VE PROFİL FOTOĞRAFI
+# =========================================================
+
+@app.route("/profil")
+@login_required
+def profil():
+    user = current_user()
+    return redirect(url_for("kanal", username=user["username"]))
+
+
+@app.route("/profil-fotografi", methods=["POST"])
+@login_required
+def profil_fotografi():
+    file = request.files.get("profile_image")
+
+    if not file or not file.filename:
+        flash("Bir fotoğraf seçmelisin.")
+        return redirect(url_for("profil"))
+
+    if not allowed_file(file.filename, IMAGE_EXTENSIONS):
+        flash("Sadece JPG, JPEG, PNG veya WEBP yükleyebilirsin.")
+        return redirect(url_for("profil"))
+
+    filename = secrets.token_hex(16) + "." + file.filename.rsplit(".", 1)[1].lower()
+    file.save(os.path.join(PROFILE_FOLDER, filename))
+
+    conn = get_db()
+    conn.execute(
+        "UPDATE users SET profile_image = ? WHERE id = ?",
+        (filename, session["user_id"])
+    )
+    conn.commit()
+    conn.close()
+
+    flash("Profil fotoğrafın güncellendi!")
+    return redirect(url_for("profil"))
+
+
+@app.route("/profil-resmi/<filename>")
+def profile_file(filename):
+    return send_from_directory(PROFILE_FOLDER, filename)
+
+
+@app.route("/kanal/<username>")
+def kanal(username):
+    conn = get_db()
+
+    channel = conn.execute(
+        "SELECT * FROM users WHERE username = ?",
+        (username,)
+    ).fetchone()
+
+    if not channel:
+        conn.close()
+        abort(404)
 
     videos = conn.execute("""
-        SELECT videos.*, users.username,
-        (SELECT COUNT(*) FROM likes
-         WHERE video_id=videos.id) AS like_count,
-        (SELECT COUNT(*) FROM comments
-         WHERE video_id=videos.id) AS comment_count
+        SELECT videos.*, users.username, users.profile_image
         FROM videos
-        JOIN users ON users.id=videos.user_id
-        WHERE videos.category=?
+        JOIN users ON users.id = videos.user_id
+        WHERE videos.user_id = ?
         ORDER BY videos.id DESC
-    """, (category,)).fetchall()
+    """, (channel["id"],)).fetchall()
+
+    count = conn.execute("""
+        SELECT COUNT(*) FROM subscriptions WHERE channel_id = ?
+    """, (channel["id"],)).fetchone()[0]
+
+    video_count = len(videos)
+    conn.close()
+
+    owner = (
+        session.get("user_id") == channel["id"]
+    )
+
+    subscribed = False
+    if session.get("user_id") and not owner:
+        subscribed = is_subscribed(
+            session["user_id"], channel["id"]
+        )
+
+    return page("Kanal", """
+    <div class="panel">
+        <div>
+            {% if channel.profile_image %}
+                <img class="profile"
+                src="{{ url_for('profile_file', filename=channel.profile_image) }}">
+            {% else %}
+                <div class="profile">{{ channel.username[0]|upper }}</div>
+            {% endif %}
+        </div>
+
+        <h1>{{ channel.username }}</h1>
+        <p class="muted">
+            ⭐ {{ count }} abone · {{ video_count }} video
+        </p>
+
+        {% if owner %}
+            <h3>Profil Fotoğrafını Değiştir</h3>
+            <form method="POST" action="{{ url_for('profil_fotografi') }}"
+            enctype="multipart/form-data">
+                <input type="file" name="profile_image"
+                accept=".jpg,.jpeg,.png,.webp" required>
+                <button>Fotoğrafı Yükle</button>
+            </form>
+        {% elif user %}
+            <form method="POST"
+            action="{{ url_for('abone', channel_id=channel.id) }}">
+                {% if subscribed %}
+                    <button>✓ Abonesin · Abonelikten Çık</button>
+                {% else %}
+                    <button>⭐ Abone Ol</button>
+                {% endif %}
+            </form>
+        {% else %}
+            <a class="btn" href="{{ url_for('giris') }}">Abone Olmak İçin Giriş Yap</a>
+        {% endif %}
+    </div>
+
+    <h2>{{ channel.username }} kanalının videoları</h2>
+    <div class="grid">
+        {% for v in videos %}
+            """ + VIDEO_CARD + """
+        {% else %}
+            <p>Bu kanalda henüz video yok.</p>
+        {% endfor %}
+    </div>
+    """,
+    channel=channel,
+    videos=videos,
+    count=count,
+    video_count=video_count,
+    owner=owner,
+    subscribed=subscribed)
+
+
+# =========================================================
+# ABONELİK SİSTEMİ
+# =========================================================
+
+@app.route("/abone/<int:channel_id>", methods=["POST"])
+@login_required
+def abone(channel_id):
+    if channel_id == session["user_id"]:
+        flash("Kendi kanalına abone olamazsın.")
+        return redirect(url_for("profil"))
+
+    conn = get_db()
+
+    channel = conn.execute(
+        "SELECT * FROM users WHERE id = ?",
+        (channel_id,)
+    ).fetchone()
+
+    if not channel:
+        conn.close()
+        abort(404)
+
+    existing = conn.execute("""
+        SELECT id FROM subscriptions
+        WHERE subscriber_id = ? AND channel_id = ?
+    """, (session["user_id"], channel_id)).fetchone()
+
+    if existing:
+        conn.execute("""
+            DELETE FROM subscriptions
+            WHERE subscriber_id = ? AND channel_id = ?
+        """, (session["user_id"], channel_id))
+        flash("Abonelikten çıktın.")
+    else:
+        conn.execute("""
+            INSERT INTO subscriptions (subscriber_id, channel_id)
+            VALUES (?, ?)
+        """, (session["user_id"], channel_id))
+        flash("Kanala abone oldun!")
+
+    conn.commit()
+    conn.close()
+
+    return redirect(url_for("kanal", username=channel["username"]))
+
+
+@app.route("/abonelikler")
+@login_required
+def abonelikler():
+    conn = get_db()
+
+    channels = conn.execute("""
+        SELECT
+            users.id,
+            users.username,
+            users.profile_image,
+            (SELECT COUNT(*) FROM subscriptions s2
+             WHERE s2.channel_id = users.id) AS subscribers,
+            (SELECT COUNT(*) FROM videos v
+             WHERE v.user_id = users.id) AS video_count
+        FROM subscriptions
+        JOIN users ON users.id = subscriptions.channel_id
+        WHERE subscriptions.subscriber_id = ?
+        ORDER BY subscriptions.id DESC
+    """, (session["user_id"],)).fetchall()
 
     conn.close()
 
-    cards = "".join(
-        render_template_string(VIDEO_CARD, v=v)
-        for v in videos
-    )
-
-    return page("""
-        <h1 class="section-title">🗂️ {{ category }}</h1>
-
-        {% if cards %}
-            <div class="grid">{{ cards|safe }}</div>
+    return page("Aboneliklerim", """
+    <h1>⭐ Aboneliklerim</h1>
+    <div class="grid">
+        {% for c in channels %}
+            <div class="card">
+                <a href="{{ url_for('kanal', username=c.username) }}">
+                    {% if c.profile_image %}
+                        <img class="profile"
+                        src="{{ url_for('profile_file', filename=c.profile_image) }}">
+                    {% else %}
+                        <div class="profile">{{ c.username[0]|upper }}</div>
+                    {% endif %}
+                    <h3>{{ c.username }}</h3>
+                </a>
+                <p class="muted">
+                    {{ c.subscribers }} abone · {{ c.video_count }} video
+                </p>
+            </div>
         {% else %}
-            <p>Bu kategoride henüz video yok.</p>
-        {% endif %}
-    """, category=category, cards=cards)
+            <p>Henüz bir kanala abone değilsin.</p>
+        {% endfor %}
+    </div>
+    """, channels=channels)
 
 
-# =========================
+# =========================================================
+# BİLDİRİMLER
+# =========================================================
+
+@app.route("/bildirimler")
+@login_required
+def bildirimler():
+    conn = get_db()
+
+    notifications = conn.execute("""
+        SELECT
+            notifications.*,
+            users.username,
+            videos.title
+        FROM notifications
+        JOIN users ON users.id = notifications.actor_id
+        LEFT JOIN videos ON videos.id = notifications.video_id
+        WHERE notifications.user_id = ?
+        ORDER BY notifications.id DESC
+    """, (session["user_id"],)).fetchall()
+
+    conn.execute("""
+        UPDATE notifications SET is_read = 1
+        WHERE user_id = ?
+    """, (session["user_id"],))
+
+    conn.commit()
+    conn.close()
+
+    return page("Bildirimler", """
+    <h1>🔔 Bildirimler</h1>
+    {% for n in notifications %}
+        <div class="panel">
+            <a href="{{ url_for('kanal', username=n.username) }}">
+                <b>{{ n.username }}</b>
+            </a>
+            yeni bir video yükledi:
+            {% if n.video_id %}
+                <a href="{{ url_for('izle', video_id=n.video_id) }}">
+                    {{ n.title or 'Video' }}
+                </a>
+            {% else %}
+                {{ n.title or 'Video' }}
+            {% endif %}
+            <p class="muted">{{ n.created_at }}</p>
+        </div>
+    {% else %}
+        <p>Henüz bildirimin yok.</p>
+    {% endfor %}
+    """, notifications=notifications)
+
+
+# =========================================================
 # VİDEO YÜKLEME
-# =========================
+# =========================================================
 
 @app.route("/yukle", methods=["GET", "POST"])
 @login_required
 def yukle():
-
     if request.method == "POST":
-
         title = request.form.get("title", "").strip()
         description = request.form.get("description", "").strip()
-        category = request.form.get("category", "Diğer")
+        category = request.form.get("category", "Genel").strip()
         file = request.files.get("video")
 
         if not title or not file or not file.filename:
             flash("Başlık ve video dosyası gerekli.")
             return redirect(url_for("yukle"))
 
-        if not allowed_file(file.filename):
-            flash("MP4, WEBM, MOV veya M4V dosyası yükleyebilirsin.")
+        if not allowed_file(file.filename, VIDEO_EXTENSIONS):
+            flash("Sadece MP4, WEBM, MOV veya M4V yükleyebilirsin.")
             return redirect(url_for("yukle"))
 
-        if category not in CATEGORIES:
-            category = "Diğer"
+        filename = secrets.token_hex(16) + "." + file.filename.rsplit(".", 1)[1].lower()
+        file.save(os.path.join(UPLOAD_FOLDER, filename))
 
-        filename = secure_filename(file.filename)
-        unique_name = secrets.token_hex(8) + "_" + filename
-
-        file.save(os.path.join(UPLOAD_FOLDER, unique_name))
-
-        conn = db()
-
-        cursor = conn.execute("""
+        conn = get_db()
+        conn.execute("""
             INSERT INTO videos
             (title, description, filename, user_id, category)
             VALUES (?, ?, ?, ?, ?)
         """, (
             title,
             description,
-            unique_name,
+            filename,
             session["user_id"],
-            category
+            category or "Genel"
         ))
 
-        video_id = cursor.lastrowid
+        video_id = conn.execute(
+            "SELECT last_insert_rowid()"
+        ).fetchone()[0]
 
-        # Abonelere bildirim gönder
+        uploader = conn.execute(
+            "SELECT username FROM users WHERE id = ?",
+            (session["user_id"],)
+        ).fetchone()
+
         subscribers = conn.execute("""
-            SELECT subscriber_id
-            FROM subscriptions
-            WHERE channel_id=?
+            SELECT subscriber_id FROM subscriptions
+            WHERE channel_id = ?
         """, (session["user_id"],)).fetchall()
+
+        message = f"{uploader['username']} yeni bir video yükledi: {title}"
 
         for subscriber in subscribers:
             conn.execute("""
@@ -773,731 +947,184 @@ def yukle():
                 subscriber["subscriber_id"],
                 session["user_id"],
                 video_id,
-                f"{session['username']} yeni bir video yükledi: {title}"
+                message
             ))
 
         conn.commit()
         conn.close()
 
         flash("Videon başarıyla yüklendi!")
-        return redirect(url_for("profil"))
+        return redirect(url_for("izle", video_id=video_id))
 
-    return page("""
-        <div class="form-box">
+    return page("Video Yükle", """
+    <div class="panel">
+        <h1>＋ Video Yükle</h1>
+        <form method="POST" enctype="multipart/form-data">
+            <input name="title" placeholder="Video başlığı" required>
+            <textarea name="description"
+            placeholder="Video açıklaması"></textarea>
 
-            <h1>⬆️ Video Yükle</h1>
-            <p>Videonu 5TVE topluluğuyla paylaş.</p>
+            <select name="category">
+                <option>Genel</option>
+                <option>Eğlence</option>
+                <option>Oyun</option>
+                <option>Müzik</option>
+                <option>Eğitim</option>
+                <option>Spor</option>
+                <option>Diğer</option>
+            </select>
 
-            <form method="POST" enctype="multipart/form-data">
+            <label>Video dosyası (MP4, WEBM, MOV, M4V)</label>
+            <input type="file" name="video"
+            accept=".mp4,.webm,.mov,.m4v" required>
 
-                <label>Video Başlığı</label>
-                <input name="title"
-                       maxlength="100"
-                       required
-                       placeholder="Videonun adı">
-
-                <label>Açıklama</label>
-                <textarea name="description"
-                          rows="4"
-                          placeholder="Videonu açıkla..."></textarea>
-
-                <label>Kategori</label>
-                <select name="category">
-                    {% for c in categories %}
-                        <option value="{{ c }}">{{ c }}</option>
-                    {% endfor %}
-                </select>
-
-                <label>Video Dosyası</label>
-                <input type="file"
-                       name="video"
-                       accept="video/mp4,video/webm,video/quicktime"
-                       required>
-
-                <button class="btn" style="width:100%">
-                    🚀 Videoyu Yayınla
-                </button>
-
-            </form>
-
-            <p>En fazla 200 MB. MP4, WEBM, MOV ve M4V desteklenir.</p>
-
-        </div>
-    """, categories=CATEGORIES)
-
-
-# =========================
-# KAYIT
-# =========================
-
-@app.route("/kayit", methods=["GET", "POST"])
-def kayit():
-
-    if request.method == "POST":
-
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-
-        if len(username) < 3 or len(username) > 30 or len(password) < 6:
-            flash("Kullanıcı adı 3-30, şifre en az 6 karakter olmalı.")
-            return redirect(url_for("kayit"))
-
-        conn = db()
-
-        try:
-            conn.execute(
-                "INSERT INTO users (username, password) VALUES (?, ?)",
-                (username, generate_password_hash(password))
-            )
-            conn.commit()
-
-        except sqlite3.IntegrityError:
-            conn.close()
-            flash("Bu kullanıcı adı zaten alınmış.")
-            return redirect(url_for("kayit"))
-
-        user = conn.execute(
-            "SELECT id FROM users WHERE username=?",
-            (username,)
-        ).fetchone()
-
-        conn.close()
-
-        session["user_id"] = user["id"]
-        session["username"] = username
-
-        return redirect(url_for("index"))
-
-    return page("""
-        <div class="form-box">
-
-            <h1>✨ Hesap Oluştur</h1>
-
-            <form method="POST">
-
-                <label>Kullanıcı Adı</label>
-                <input name="username"
-                       required
-                       minlength="3"
-                       maxlength="30">
-
-                <label>Şifre</label>
-                <input type="password"
-                       name="password"
-                       required
-                       minlength="6">
-
-                <button class="btn" style="width:100%">
-                    Kayıt Ol
-                </button>
-
-            </form>
-
-            <p>
-                Zaten hesabın var mı?
-                <a href="/giris">Giriş yap</a>
-            </p>
-
-        </div>
+            <button type="submit">Videoyu Yükle</button>
+        </form>
+    </div>
     """)
 
 
-# =========================
-# GİRİŞ
-# =========================
-
-@app.route("/giris", methods=["GET", "POST"])
-def giris():
-
-    if request.method == "POST":
-
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "")
-
-        conn = db()
-
-        user = conn.execute(
-            "SELECT * FROM users WHERE username=?",
-            (username,)
-        ).fetchone()
-
-        conn.close()
-
-        if user and check_password_hash(user["password"], password):
-
-            session["user_id"] = user["id"]
-            session["username"] = user["username"]
-
-            return redirect(url_for("index"))
-
-        flash("Kullanıcı adı veya şifre yanlış.")
-        return redirect(url_for("giris"))
-
-    return page("""
-        <div class="form-box">
-
-            <h1>🔑 Giriş Yap</h1>
-
-            <form method="POST">
-
-                <label>Kullanıcı Adı</label>
-                <input name="username" required>
-
-                <label>Şifre</label>
-                <input type="password"
-                       name="password"
-                       required>
-
-                <button class="btn" style="width:100%">
-                    Giriş Yap
-                </button>
-
-            </form>
-
-            <p>
-                Hesabın yok mu?
-                <a href="/kayit">Kayıt ol</a>
-            </p>
-
-        </div>
-    """)
-
-
-# =========================
-# ÇIKIŞ
-# =========================
-
-@app.route("/cikis")
-def cikis():
-    session.clear()
-    return redirect(url_for("index"))
-
-
-# =========================
-# PROFİL
-# =========================
-
-@app.route("/profil")
-@login_required
-def profil():
-    return redirect(
-        url_for("kanal", username=session["username"])
-    )
-
-
-# =========================
-# KANAL PROFİLİ
-# =========================
-
-@app.route("/kanal/<username>")
-def kanal(username):
-
-    conn = db()
-
-    user = conn.execute(
-        "SELECT * FROM users WHERE username=?",
-        (username,)
-    ).fetchone()
-
-    if not user:
-        conn.close()
-        abort(404)
-
-    videos = conn.execute("""
-        SELECT videos.*, users.username,
-        (SELECT COUNT(*) FROM likes
-         WHERE video_id=videos.id) AS like_count,
-        (SELECT COUNT(*) FROM comments
-         WHERE video_id=videos.id) AS comment_count
-        FROM videos
-        JOIN users ON users.id=videos.user_id
-        WHERE videos.user_id=?
-        ORDER BY videos.id DESC
-    """, (user["id"],)).fetchall()
-
-    subscriber_count = conn.execute("""
-        SELECT COUNT(*) AS total
-        FROM subscriptions
-        WHERE channel_id=?
-    """, (user["id"],)).fetchone()["total"]
-
-    is_owner = session.get("user_id") == user["id"]
-    is_subscribed = False
-
-    if session.get("user_id") and not is_owner:
-        is_subscribed = conn.execute("""
-            SELECT id
-            FROM subscriptions
-            WHERE subscriber_id=? AND channel_id=?
-        """, (
-            session["user_id"],
-            user["id"]
-        )).fetchone() is not None
-
-    conn.close()
-
-    cards = "".join(
-        render_template_string(VIDEO_CARD, v=v)
-        for v in videos
-    )
-
-    return page("""
-        <div class="profile-header">
-
-            <div class="avatar">
-                {{ username[0]|upper }}
-            </div>
-
-            <h1>{{ username }}</h1>
-            <p>5TVE Kanalı</p>
-
-            <h3>⭐ {{ subscriber_count }} Abone</h3>
-
-            {% if is_owner %}
-
-                <a href="/yukle" class="btn">
-                    ⬆️ Video Yükle
-                </a>
-
-            {% elif session.get('user_id') %}
-
-                <form method="POST"
-                      action="{{ url_for('abone_ol', channel_id=user_id) }}">
-
-                    <button class="btn">
-                        {{ '✓ Abonesin · Abonelikten Çık'
-                           if is_subscribed else '⭐ Abone Ol' }}
-                    </button>
-
-                </form>
-
-            {% else %}
-
-                <a class="btn" href="/giris">
-                    Abone olmak için giriş yap
-                </a>
-
-            {% endif %}
-
-        </div>
-
-        <h2 class="section-title">🎬 Kanal Videoları</h2>
-
-        {% if cards %}
-            <div class="grid">{{ cards|safe }}</div>
-        {% else %}
-            <p>Bu kanalda henüz video yok.</p>
-        {% endif %}
-
-    """,
-    username=username,
-    user_id=user["id"],
-    subscriber_count=subscriber_count,
-    is_owner=is_owner,
-    is_subscribed=is_subscribed,
-    cards=cards)
-
-
-# =========================
-# ABONE OL / ABONELİKTEN ÇIK
-# =========================
-
-@app.route("/abone/<int:channel_id>", methods=["POST"])
-@login_required
-def abone_ol(channel_id):
-
-    subscriber_id = session["user_id"]
-
-    conn = db()
-
-    channel = conn.execute(
-        "SELECT * FROM users WHERE id=?",
-        (channel_id,)
-    ).fetchone()
-
-    if not channel:
-        conn.close()
-        abort(404)
-
-    if subscriber_id == channel_id:
-        conn.close()
-        flash("Kendi kanalına abone olamazsın.")
-        return redirect(url_for(
-            "kanal",
-            username=channel["username"]
-        ))
-
-    existing = conn.execute("""
-        SELECT id
-        FROM subscriptions
-        WHERE subscriber_id=? AND channel_id=?
-    """, (
-        subscriber_id,
-        channel_id
-    )).fetchone()
-
-    if existing:
-
-        conn.execute("""
-            DELETE FROM subscriptions
-            WHERE subscriber_id=? AND channel_id=?
-        """, (
-            subscriber_id,
-            channel_id
-        ))
-
-        flash("Abonelikten çıktın.")
-
-    else:
-
-        conn.execute("""
-            INSERT OR IGNORE INTO subscriptions
-            (subscriber_id, channel_id)
-            VALUES (?, ?)
-        """, (
-            subscriber_id,
-            channel_id
-        ))
-
-        flash("Kanala başarıyla abone oldun! ⭐")
-
-    conn.commit()
-    conn.close()
-
-    return redirect(url_for(
-        "kanal",
-        username=channel["username"]
-    ))
-
-
-# =========================
-# ABONELİKLERİM
-# =========================
-
-@app.route("/abonelikler")
-@login_required
-def abonelikler():
-
-    conn = db()
-
-    channels = conn.execute("""
-        SELECT users.id,
-               users.username,
-
-        (SELECT COUNT(*)
-         FROM subscriptions
-         WHERE channel_id=users.id) AS subscriber_count,
-
-        (SELECT COUNT(*)
-         FROM videos
-         WHERE user_id=users.id) AS video_count
-
-        FROM subscriptions
-
-        JOIN users
-        ON users.id=subscriptions.channel_id
-
-        WHERE subscriptions.subscriber_id=?
-
-        ORDER BY subscriptions.id DESC
-    """, (session["user_id"],)).fetchall()
-
-    conn.close()
-
-    return page("""
-        <h1 class="section-title">⭐ Aboneliklerim</h1>
-
-        {% if channels %}
-
-            <div class="grid">
-
-                {% for channel in channels %}
-
-                    <div class="video-card" style="padding:22px">
-
-                        <div class="avatar">
-                            {{ channel['username'][0]|upper }}
-                        </div>
-
-                        <h2>{{ channel['username'] }}</h2>
-
-                        <p>
-                            ⭐ {{ channel['subscriber_count'] }} abone
-                        </p>
-
-                        <p>
-                            🎬 {{ channel['video_count'] }} video
-                        </p>
-
-                        <a class="btn"
-                           href="{{ url_for(
-                               'kanal',
-                               username=channel['username']
-                           ) }}">
-                            Kanalı Gör
-                        </a>
-
-                    </div>
-
-                {% endfor %}
-
-            </div>
-
-        {% else %}
-
-            <p>Henüz hiçbir kanala abone değilsin.</p>
-
-            <a href="/kesfet" class="btn">
-                Kanalları Keşfet
-            </a>
-
-        {% endif %}
-    """, channels=channels)
-
-
-# =========================
-# BİLDİRİMLER
-# =========================
-
-@app.route("/bildirimler")
-@login_required
-def bildirimler():
-
-    conn = db()
-
-    notifications = conn.execute("""
-        SELECT notifications.*,
-               users.username,
-               videos.title
-        FROM notifications
-
-        JOIN users
-        ON users.id=notifications.actor_id
-
-        JOIN videos
-        ON videos.id=notifications.video_id
-
-        WHERE notifications.user_id=?
-
-        ORDER BY notifications.id DESC
-    """, (session["user_id"],)).fetchall()
-
-    conn.execute("""
-        UPDATE notifications
-        SET is_read=1
-        WHERE user_id=?
-    """, (session["user_id"],))
-
-    conn.commit()
-    conn.close()
-
-    return page("""
-        <h1 class="section-title">🔔 Bildirimler</h1>
-
-        {% if notifications %}
-
-            {% for n in notifications %}
-
-                <div class="notification
-                    {{ 'unread' if not n['is_read'] else '' }}">
-
-                    <b>🔔 {{ n['username'] }}</b>
-
-                    <p>{{ n['message'] }}</p>
-
-                    <a class="btn"
-                       href="{{ url_for(
-                           'izle',
-                           video_id=n['video_id']
-                       ) }}">
-                        Videoyu İzle
-                    </a>
-
-                    <p>
-                        <small>{{ n['created_at'] }}</small>
-                    </p>
-
-                </div>
-
-            {% endfor %}
-
-        {% else %}
-
-            <p>Henüz bildirimin yok.</p>
-
-        {% endif %}
-    """, notifications=notifications)
-
-
-# =========================
+# =========================================================
 # VİDEO İZLEME
-# =========================
+# =========================================================
 
 @app.route("/izle/<int:video_id>")
 def izle(video_id):
+    conn = get_db()
 
-    video = get_video(video_id)
+    video = conn.execute("""
+        SELECT videos.*, users.username, users.profile_image
+        FROM videos
+        JOIN users ON users.id = videos.user_id
+        WHERE videos.id = ?
+    """, (video_id,)).fetchone()
 
     if not video:
+        conn.close()
         abort(404)
 
-    conn = db()
-
     comments = conn.execute("""
-        SELECT comments.*, users.username
+        SELECT comments.*, users.username, users.profile_image
         FROM comments
-        JOIN users ON users.id=comments.user_id
-        WHERE comments.video_id=?
+        JOIN users ON users.id = comments.user_id
+        WHERE comments.video_id = ?
         ORDER BY comments.id DESC
     """, (video_id,)).fetchall()
 
+    likes = conn.execute(
+        "SELECT COUNT(*) FROM likes WHERE video_id = ?",
+        (video_id,)
+    ).fetchone()[0]
+
     liked = False
-
     if session.get("user_id"):
-
         liked = conn.execute("""
             SELECT id FROM likes
-            WHERE user_id=? AND video_id=?
-        """, (
-            session["user_id"],
-            video_id
-        )).fetchone() is not None
+            WHERE user_id = ? AND video_id = ?
+        """, (session["user_id"], video_id)).fetchone() is not None
 
     conn.close()
 
-    return page("""
-        <div class="form-box" style="max-width:950px">
+    return page(video["title"], """
+    <div class="panel">
+        <video controls autoplay style="width:100%;max-height:600px"
+        src="{{ url_for('video_file', filename=video.filename) }}">
+        </video>
 
-            <video controls playsinline>
-                <source src="{{ url_for(
-                    'video_file',
-                    filename=video['filename']
-                ) }}">
-            </video>
+        <h1>{{ video.title }}</h1>
+        <p>{{ video.description or '' }}</p>
 
-            <h1>{{ video['title'] }}</h1>
+        <p>
+            <a href="{{ url_for('kanal', username=video.username) }}">
+                {% if video.profile_image %}
+                    <img class="avatar-small"
+                    src="{{ url_for('profile_file', filename=video.profile_image) }}">
+                {% endif %}
+                {{ video.username }}
+            </a>
+        </p>
 
-            <p>
-                👤
-                <a href="{{ url_for(
-                    'kanal',
-                    username=video['username']
-                ) }}">
-                    {{ video['username'] }}
-                </a>
-            </p>
+        <p class="muted">
+            {{ video.category }} · {{ video.created_at }}
+        </p>
 
-            <p>{{ video['description'] or '' }}</p>
+        <p>❤️ {{ likes }} beğeni</p>
 
-            <p>🗂️ {{ video['category'] or 'Diğer' }}</p>
+        {% if user %}
+            <form class="inline" method="POST"
+            action="{{ url_for('begeni', video_id=video.id) }}">
+                <button>
+                    {% if liked %}❤️ Beğeniyi Geri Al{% else %}🤍 Beğen{% endif %}
+                </button>
+            </form>
+        {% else %}
+            <a class="btn" href="{{ url_for('giris') }}">Beğenmek için giriş yap</a>
+        {% endif %}
+    </div>
 
-            <p>❤️ {{ video['like_count'] }} beğeni</p>
+    <div class="panel">
+        <h2>Yorumlar</h2>
+        {% if user %}
+            <form method="POST"
+            action="{{ url_for('yorum', video_id=video.id) }}">
+                <textarea name="content"
+                placeholder="Yorum yaz..." required></textarea>
+                <button>Yorum Gönder</button>
+            </form>
+        {% else %}
+            <p>Yorum yapmak için giriş yapmalısın.</p>
+        {% endif %}
 
-            {% if session.get('user_id') %}
+        {% for c in comments %}
+            <div class="panel">
+                <b>
+                    <a href="{{ url_for('kanal', username=c.username) }}">
+                        {{ c.username }}
+                    </a>
+                </b>
+                <p>{{ c.content }}</p>
+                <span class="muted">{{ c.created_at }}</span>
+            </div>
+        {% else %}
+            <p>Henüz yorum yok.</p>
+        {% endfor %}
+    </div>
+    """,
+    video=video,
+    comments=comments,
+    likes=likes,
+    liked=liked)
 
-                <form method="POST"
-                      action="{{ url_for(
-                          'begeni',
-                          video_id=video['id']
-                      ) }}">
-
-                    <button class="btn">
-                        {{ '❤️ Beğeniyi Geri Al'
-                           if liked else '🤍 Beğen' }}
-                    </button>
-
-                </form>
-
-                <form method="POST"
-                      action="{{ url_for(
-                          'yorum',
-                          video_id=video['id']
-                      ) }}">
-
-                    <label>Yorum Yap</label>
-
-                    <textarea name="content"
-                              required
-                              maxlength="1000"
-                              placeholder="Yorumunu yaz..."></textarea>
-
-                    <button class="btn">
-                        Yorumu Gönder
-                    </button>
-
-                </form>
-
-            {% else %}
-
-                <p>
-                    Beğenmek ve yorum yapmak için
-                    <a href="/giris">giriş yap.</a>
-                </p>
-
-            {% endif %}
-
-            <h2>💬 Yorumlar</h2>
-
-            {% for c in comments %}
-
-                <div class="comment">
-
-                    <b>{{ c['username'] }}</b>
-
-                    <p>{{ c['content'] }}</p>
-
-                    <small>{{ c['created_at'] }}</small>
-
-                </div>
-
-            {% else %}
-
-                <p>Henüz yorum yok.</p>
-
-            {% endfor %}
-
-        </div>
-    """, video=video, comments=comments, liked=liked)
-
-
-# =========================
-# BEĞENİ
-# =========================
 
 @app.route("/begeni/<int:video_id>", methods=["POST"])
 @login_required
 def begeni(video_id):
+    conn = get_db()
 
-    conn = db()
+    video = conn.execute(
+        "SELECT id FROM videos WHERE id = ?",
+        (video_id,)
+    ).fetchone()
 
-    exists = conn.execute("""
+    if not video:
+        conn.close()
+        abort(404)
+
+    existing = conn.execute("""
         SELECT id FROM likes
-        WHERE user_id=? AND video_id=?
-    """, (
-        session["user_id"],
-        video_id
-    )).fetchone()
+        WHERE user_id = ? AND video_id = ?
+    """, (session["user_id"], video_id)).fetchone()
 
-    if exists:
-
-        conn.execute("""
-            DELETE FROM likes
-            WHERE user_id=? AND video_id=?
-        """, (
-            session["user_id"],
-            video_id
-        ))
-
+    if existing:
+        conn.execute(
+            "DELETE FROM likes WHERE id = ?",
+            (existing["id"],)
+        )
     else:
-
         conn.execute("""
-            INSERT OR IGNORE INTO likes
-            (user_id, video_id)
+            INSERT OR IGNORE INTO likes (user_id, video_id)
             VALUES (?, ?)
-        """, (
-            session["user_id"],
-            video_id
-        ))
+        """, (session["user_id"], video_id))
 
     conn.commit()
     conn.close()
@@ -1505,57 +1132,54 @@ def begeni(video_id):
     return redirect(url_for("izle", video_id=video_id))
 
 
-# =========================
-# YORUM
-# =========================
-
 @app.route("/yorum/<int:video_id>", methods=["POST"])
 @login_required
 def yorum(video_id):
-
     content = request.form.get("content", "").strip()
 
-    if content:
+    if not content:
+        flash("Yorum boş olamaz.")
+        return redirect(url_for("izle", video_id=video_id))
 
-        conn = db()
+    conn = get_db()
 
-        conn.execute("""
-            INSERT INTO comments
-            (video_id, user_id, content)
-            VALUES (?, ?, ?)
-        """, (
-            video_id,
-            session["user_id"],
-            content[:1000]
-        ))
+    video = conn.execute(
+        "SELECT id FROM videos WHERE id = ?",
+        (video_id,)
+    ).fetchone()
 
-        conn.commit()
+    if not video:
         conn.close()
+        abort(404)
+
+    conn.execute("""
+        INSERT INTO comments (user_id, video_id, content)
+        VALUES (?, ?, ?)
+    """, (session["user_id"], video_id, content))
+
+    conn.commit()
+    conn.close()
 
     return redirect(url_for("izle", video_id=video_id))
 
 
-# =========================
-# VİDEO DOSYASI
-# =========================
+# =========================================================
+# DOSYA SERVİSİ
+# =========================================================
 
 @app.route("/video/<filename>")
 def video_file(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
 
-# =========================
-# HATA SAYFASI
-# =========================
-
 @app.errorhandler(413)
-def too_large(error):
-    return "Video çok büyük! En fazla 200 MB yükleyebilirsin.", 413
+def file_too_large(error):
+    return "Dosya çok büyük. En fazla 200 MB yükleyebilirsin.", 413
 
 
-# =========================
-# BAŞLAT
-# =========================
+# =========================================================
+# ÇALIŞTIR
+# =========================================================
 
 if __name__ == "__main__":
     app.run(debug=True)
